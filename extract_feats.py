@@ -1,9 +1,18 @@
+import cv2
+import torch
+
+#from face_ssd_infer import SSD
+import numpy as np
+import matplotlib.pyplot as plt
+import math
 import torch
 import torchvision
 import torch.nn as nn
 from data.config import TestBaseTransform, widerface_640 as cfg
 from layers import Detect, get_prior_boxes, FEM, pa_multibox, mio_module, upsample_product
 from utils import resize_image
+import os
+import pickle
 
 
 class SSD(nn.Module):
@@ -86,9 +95,10 @@ class SSD(nn.Module):
         conv4_3_x = self.layer2(conv3_3_x)
         conv5_3_x = self.layer3(conv4_3_x)
         fc7_x = self.layer4(conv5_3_x)
+
         conv6_2_x = self.layer5(fc7_x)
         conv7_2_x = self.layer6(conv6_2_x)
-
+        #print(conv7_2_x.size())
         lfpn3 = upsample_product(self.latlayer3(fc7_x), self.smooth3(conv5_3_x))
         lfpn2 = upsample_product(self.latlayer2(lfpn3), self.smooth2(conv4_3_x))
         lfpn1 = upsample_product(self.latlayer1(lfpn2), self.smooth1(conv3_3_x))
@@ -152,3 +162,148 @@ class SSD(nn.Module):
         detections[:, :4] *= scale
 
         return detections
+
+
+def eucledian(p1, p2):
+    return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+def centroid(bbox):
+    return (bbox[0] + bbox[2]/2.0, bbox[1] + bbox[3]/2.0)
+
+def vis_detections_cur(im, dets, fig, ax, history, thresh=0.5, show_text=True):
+    """Draw detected bounding boxes."""
+    class_name = 'face'
+    inds = np.where(dets[:, -1] >= thresh)[0] if dets is not None else []
+    if len(inds) == 0:
+        return []
+    im = im[:, :, (2, 1, 0)]
+    #plt.clf()
+    [p.remove() for p in reversed(ax.patches)]
+    ax.imshow(im, aspect='equal')
+    #print(dets)
+    #exit(0)
+    cur_history = []
+    for i in inds:
+        bbox = dets[i, :4]
+        score = dets[i, -1]
+        cur_centroid = centroid(bbox)
+        #print(cur_centroid)
+        #for cent in history:
+        #if eucledian(cent, cur_centroid) < 1000 or True:
+        ax.add_patch(
+            plt.Rectangle((bbox[0], bbox[1]),
+                          bbox[2] - bbox[0],
+                          bbox[3] - bbox[1], fill=False,
+                          edgecolor='red', linewidth=2.5))
+        #break
+    return cur_history
+
+def process_img(img, target_size, device, conf_thresh):
+    detections = net.detect_on_image(img, target_size, device, is_pad=False, keep_thresh=conf_thresh)
+    #print(detections)
+    imgs = []
+    #print(type(detections))
+    for idx in range(detections.shape[0]):
+        bbox = detections[idx, :4]
+        bbox = [int(round(x)) for x in bbox]
+        #print(bbox)
+        crop_img = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+        imgs.append(crop_img)
+    #print(bbox)
+    #cv2.imshow("cropped", crop_img)
+    #cv2.imwrite("out2.png", crop_img)
+    return imgs
+    #cv2.waitKey(0)
+
+    #history = vis_detections_cur(img, detections, fig, ax, history, conf_thresh, show_text=False)
+    #return history
+
+def video_cap_and_process(vidcap, target_size, device, conf_thresh):
+    
+    success,image = vidcap.read()
+    # plt.ion()
+    # fig, ax = plt.subplots(figsize=(12, 12))
+    cnt = 0
+    # history = []
+    embeds = []
+    while success:
+        if cnt % 10 == 0:
+            embed = process_img(image, target_size, device, conf_thresh)
+            #cv2.imwrite("out3.png", embed[0])
+            embeds.append(embed)
+        cnt += 1
+        if cnt%(60*60) == 0:
+            print("Done with " + str(cnt/(60 * 60)) + " minutes")
+        #print(cnt)
+        #cv2.imshow(image)     # save frame as JPEG file
+
+        success,image = vidcap.read()
+    return embeds
+        #process_img(image, target_size, device, conf_thresh)
+
+def video_cap_for_file(fl, device, out_fl):
+    conf_thresh = 0.3
+    out_fll = out_fl[:-4] + ".pickle"
+    if os.path.exists(out_fll):
+        print("File exists: " + out_fll)
+        return
+    cap = cv2.VideoCapture(fl)
+    w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    target_size = (w, h)
+    ret = video_cap_and_process(cap, target_size, device, conf_thresh)
+    with open(out_fl[:-4] + ".pickle","wb") as ff:
+        pickle.dump(ret, ff)
+        ff.close()
+    #print(len(ret))
+    #print(len(ret[450]))
+    #cv2.imwrite("out5.png", ret[450][0])
+    #exit(0)
+
+if __name__ == "__main__":
+    #fl = "/media/forsad/Expansion_3/Study Components/FACS/ICK Videos for FACS/1001/1001_COLOR_0 Video 2 4_4_2018 2_42_38 PM 2.mp4"
+    
+    device = torch.device("cuda")
+    net = SSD("test")
+    net.load_state_dict(torch.load('weights/WIDERFace_DSFD_RES152.pth'))
+    net.to(device).eval()
+
+    base_dir = "/media/forsad/grabell_box2/Study Components/FACS/ICK Videos for FACS"
+    folders = os.listdir(base_dir)
+
+    out_dir = "/media/forsad/grabell_box2/study_crops"
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    for folder in folders:
+        #print(folder)
+        full_folder = os.path.join(base_dir, folder)
+        if not os.path.isdir(full_folder):
+            continue
+        #print(foler)
+        out_folder = os.path.join(out_dir, folder)
+
+        if not os.path.exists(out_folder):
+            os.makedirs(out_folder)
+        
+        fls = os.listdir(full_folder)
+        for fl in fls:
+            if not fl.endswith(".mp4"):
+                continue
+            full_p = os.path.join(full_folder, fl)
+
+            print(full_p)
+            out_fl = os.path.join(out_folder, fl)
+            video_cap_for_file(full_p, device, out_fl)
+    #fl = "/media/forsad/grabell_box2/Study Components/FACS/ICK Videos for FACS/1001/1001_FETCH_0 Video 1 4_4_2018 2_16_04 PM 1.mp4"
+    #video_cap_for_file(fl, device, out_dir)
+    # conf_thresh = 0.3
+    # cap = cv2.VideoCapture(fl)
+    # w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    # h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    # target_size = (w, h)
+
+
+  
+    #self.resnet = models.resnet18(pretrained=True)
+    #embeds = video_cap_and_process(cap, target_size, device, conf_thresh)
+    #print(type(img))
