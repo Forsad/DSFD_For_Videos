@@ -11,158 +11,10 @@ import torch.nn as nn
 from data.config import TestBaseTransform, widerface_640 as cfg
 from layers import Detect, get_prior_boxes, FEM, pa_multibox, mio_module, upsample_product
 from utils import resize_image
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import os
 import pickle
-
-
-class SSD(nn.Module):
-
-    def __init__(self, phase, nms_thresh=0.3, nms_conf_thresh=0.01):
-        super(SSD, self).__init__()
-        self.phase = phase
-        self.num_classes = 2
-        self.cfg = cfg
-
-        resnet = torchvision.models.resnet152(pretrained=True)
-
-        self.layer1 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool, resnet.layer1)
-        self.layer2 = nn.Sequential(resnet.layer2)
-        self.layer3 = nn.Sequential(resnet.layer3)
-        self.layer4 = nn.Sequential(resnet.layer4)
-        self.layer5 = nn.Sequential(
-            *[nn.Conv2d(2048, 512, kernel_size=1),
-              nn.BatchNorm2d(512),
-              nn.ReLU(inplace=True),
-              nn.Conv2d(512, 512, kernel_size=3, padding=1, stride=2),
-              nn.BatchNorm2d(512),
-              nn.ReLU(inplace=True)]
-        )
-        self.layer6 = nn.Sequential(
-            *[nn.Conv2d(512, 128, kernel_size=1, ),
-              nn.BatchNorm2d(128),
-              nn.ReLU(inplace=True),
-              nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2),
-              nn.BatchNorm2d(256),
-              nn.ReLU(inplace=True)]
-        )
-
-        output_channels = [256, 512, 1024, 2048, 512, 256]
-
-        # FPN
-        fpn_in = output_channels
-
-        self.latlayer3 = nn.Conv2d(fpn_in[3], fpn_in[2], kernel_size=1, stride=1, padding=0)
-        self.latlayer2 = nn.Conv2d(fpn_in[2], fpn_in[1], kernel_size=1, stride=1, padding=0)
-        self.latlayer1 = nn.Conv2d(fpn_in[1], fpn_in[0], kernel_size=1, stride=1, padding=0)
-
-        self.smooth3 = nn.Conv2d(fpn_in[2], fpn_in[2], kernel_size=1, stride=1, padding=0)
-        self.smooth2 = nn.Conv2d(fpn_in[1], fpn_in[1], kernel_size=1, stride=1, padding=0)
-        self.smooth1 = nn.Conv2d(fpn_in[0], fpn_in[0], kernel_size=1, stride=1, padding=0)
-
-        # FEM
-        cpm_in = output_channels
-
-        self.cpm3_3 = FEM(cpm_in[0])
-        self.cpm4_3 = FEM(cpm_in[1])
-        self.cpm5_3 = FEM(cpm_in[2])
-        self.cpm7 = FEM(cpm_in[3])
-        self.cpm6_2 = FEM(cpm_in[4])
-        self.cpm7_2 = FEM(cpm_in[5])
-
-        # head
-        head = pa_multibox(output_channels)
-        self.loc = nn.ModuleList(head[0])
-        self.conf = nn.ModuleList(head[1])
-
-        self.softmax = nn.Softmax(dim=-1)
-
-        if self.phase != 'onnx_export':
-            self.detect = Detect(self.num_classes, 0, cfg['num_thresh'], nms_conf_thresh, nms_thresh,
-                                 cfg['variance'])
-            self.last_image_size = None
-            self.last_feature_maps = None
-
-        if self.phase == 'test':
-            self.test_transform = TestBaseTransform((104, 117, 123))
-
-    def forward(self, x):
-
-        image_size = [x.shape[2], x.shape[3]]
-        loc = list()
-        conf = list()
-
-        conv3_3_x = self.layer1(x)
-        conv4_3_x = self.layer2(conv3_3_x)
-        conv5_3_x = self.layer3(conv4_3_x)
-        fc7_x = self.layer4(conv5_3_x)
-
-        conv6_2_x = self.layer5(fc7_x)
-        conv7_2_x = self.layer6(conv6_2_x)
-        #print(conv7_2_x.size())
-        lfpn3 = upsample_product(self.latlayer3(fc7_x), self.smooth3(conv5_3_x))
-        lfpn2 = upsample_product(self.latlayer2(lfpn3), self.smooth2(conv4_3_x))
-        lfpn1 = upsample_product(self.latlayer1(lfpn2), self.smooth1(conv3_3_x))
-
-        conv5_3_x = lfpn3
-        conv4_3_x = lfpn2
-        conv3_3_x = lfpn1
-
-        sources = [conv3_3_x, conv4_3_x, conv5_3_x, fc7_x, conv6_2_x, conv7_2_x]
-
-        sources[0] = self.cpm3_3(sources[0])
-        sources[1] = self.cpm4_3(sources[1])
-        sources[2] = self.cpm5_3(sources[2])
-        sources[3] = self.cpm7(sources[3])
-        sources[4] = self.cpm6_2(sources[4])
-        sources[5] = self.cpm7_2(sources[5])
-
-        # apply multibox head to source layers
-        featuremap_size = []
-        for (x, l, c) in zip(sources, self.loc, self.conf):
-            featuremap_size.append([x.shape[2], x.shape[3]])
-            loc.append(l(x).permute(0, 2, 3, 1).contiguous())
-            len_conf = len(conf)
-            cls = mio_module(c(x), len_conf)
-            conf.append(cls.permute(0, 2, 3, 1).contiguous())
-
-        face_loc = torch.cat([o[:, :, :, :4].contiguous().view(o.size(0), -1) for o in loc], 1)
-        face_loc = face_loc.view(face_loc.size(0), -1, 4)
-        face_conf = torch.cat([o[:, :, :, :2].contiguous().view(o.size(0), -1) for o in conf], 1)
-        face_conf = self.softmax(face_conf.view(face_conf.size(0), -1, self.num_classes))
-
-        if self.phase != 'onnx_export':
-
-            if self.last_image_size is None or self.last_image_size != image_size or self.last_feature_maps != featuremap_size:
-                self.priors = get_prior_boxes(self.cfg, featuremap_size, image_size).to(face_loc.device)
-                self.last_image_size = image_size
-                self.last_feature_maps = featuremap_size
-            with torch.no_grad():
-                output = self.detect(face_loc, face_conf, self.priors)
-        else:
-            output = torch.cat((face_loc, face_conf), 2)
-        return output
-
-    def detect_on_image(self, source_image, target_size, device, is_pad=False, keep_thresh=0.3):
-
-        image, shift_h_scaled, shift_w_scaled, scale = resize_image(source_image, target_size, is_pad=is_pad)
-
-        x = torch.from_numpy(self.test_transform(image)).permute(2, 0, 1).to(device)
-        x.unsqueeze_(0)
-
-        detections = self.forward(x).cpu().numpy()
-        #print(detections)
-
-        scores = detections[0, 1, :, 0]
-        keep_idxs = scores > keep_thresh  # find keeping indexes
-        detections = detections[0, 1, keep_idxs, :]  # select detections over threshold
-        detections = detections[:, [1, 2, 3, 4, 0]]  # reorder
-
-        detections[:, [0, 2]] -= shift_w_scaled  # 0 or pad percent from left corner
-        detections[:, [1, 3]] -= shift_h_scaled  # 0 or pad percent from top
-        detections[:, :4] *= scale
-
-        return detections
-
+from face_ssd_infer import SSD
 
 def eucledian(p1, p2):
     return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
@@ -197,63 +49,86 @@ def vis_detections_cur(im, dets, fig, ax, history, thresh=0.5, show_text=True):
         #break
     return cur_history
 
-def process_img(img, target_size, device, conf_thresh):
-    detections = net.detect_on_image(img, target_size, device, is_pad=False, keep_thresh=conf_thresh)
+def process_img(img, target_size, device, conf_thresh, net):
+    (all_detections, keep_idxes) = net.detect_on_image(img, target_size, device, False, conf_thresh)
     #print(detections)
-    imgs = []
     #print(type(detections))
+    keep_idxes = all_detections[:, 4] > conf_thresh
+    #print(all_detections)
+    #print(keep_idxes)
+    detections = all_detections[keep_idxes, :]
+    #exit(0)
+    #print(detections[0])
     for idx in range(detections.shape[0]):
         bbox = detections[idx, :4]
-        bbox = [int(round(x)) for x in bbox]
-        #print(bbox)
-        crop_img = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-        imgs.append(crop_img)
+        ibbox = [int(round(x)) for x in bbox]
+        #exit(0)
+        cv2.rectangle(img, (ibbox[0], ibbox[1]), (ibbox[2], ibbox[3]), (0, 255, 0), 5)
+        #exit(0)
+
+        #crop_img = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
     #print(bbox)
-    #cv2.imshow("cropped", crop_img)
+    # cv2.imshow("cropped", img)
+    # cv2.waitKey(0)
+    # exit(0)
     #cv2.imwrite("out2.png", crop_img)
-    return imgs
+    return all_detections
     #cv2.waitKey(0)
 
     #history = vis_detections_cur(img, detections, fig, ax, history, conf_thresh, show_text=False)
     #return history
 
-def video_cap_and_process(vidcap, target_size, device, conf_thresh):
+def video_cap_and_process(vidcap, target_size, device, conf_thresh, net, cvWriter):
     
     success,image = vidcap.read()
     # plt.ion()
-    # fig, ax = plt.subplots(figsize=(12, 12))
+    # fig, ax = plt.subplots(figsize= (12, 12))
     cnt = 0
     # history = []
     embeds = []
     while success:
-        if cnt % 10 == 0:
-            embed = process_img(image, target_size, device, conf_thresh)
-            #cv2.imwrite("out3.png", embed[0])
-            embeds.append(embed)
+        embed = process_img(image, target_size, device, conf_thresh, net)
+        cvWriter.write(image)
+        #cv2.imwrite("out3.png", embed[0])
+        embeds.append(embed)
         cnt += 1
-        if cnt%(60*60) == 0:
-            print("Done with " + str(cnt/(60 * 60)) + " minutes")
+        if cnt%(60 * 30) == 0:
+            break
+        #if cnt%(60*60) == 0:
+            #print("Done with " + str(cnt/(60 * 60)) + " minutes")
         #print(cnt)
         #cv2.imshow(image)     # save frame as JPEG file
 
-        success,image = vidcap.read()
+        success, image = vidcap.read()
     return embeds
         #process_img(image, target_size, device, conf_thresh)
 
-def video_cap_for_file(fl, device, out_fl):
-    conf_thresh = 0.3
-    out_fll = out_fl[:-4] + ".pickle"
-    if os.path.exists(out_fll):
-        print("File exists: " + out_fll)
-        return
-    cap = cv2.VideoCapture(fl)
-    w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    target_size = (w, h)
-    ret = video_cap_and_process(cap, target_size, device, conf_thresh)
-    with open(out_fl[:-4] + ".pickle","wb") as ff:
-        pickle.dump(ret, ff)
-        ff.close()
+def video_cap_for_file(fl, device, out_fl, net):
+    try:
+        conf_thresh = 0.3
+        out_fll = out_fl[:-4] + ".pickle"
+        if os.path.exists(out_fll):
+            print("File exists: " + out_fll)
+            return
+        cap = cv2.VideoCapture(fl)
+        w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        target_size = (w, h)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        cvWriter = cv2.VideoWriter(out_fl, fourcc, fps, (int(w), int(h)))
+
+        ret = video_cap_and_process(cap, target_size, device, conf_thresh, net, cvWriter)
+        with open(out_fl[:-4] + ".pickle","wb") as ff:
+            pickle.dump(ret, ff)
+            ff.close()
+        cap.release()
+        cvWriter.release()
+        print('cvWriter done')
+        print("Done with " + fl)
+    except Exception as e:
+        print(str(e) + "; was working on " + fl)
     #print(len(ret))
     #print(len(ret[450]))
     #cv2.imwrite("out5.png", ret[450][0])
@@ -261,19 +136,23 @@ def video_cap_for_file(fl, device, out_fl):
 
 if __name__ == "__main__":
     #fl = "/media/forsad/Expansion_3/Study Components/FACS/ICK Videos for FACS/1001/1001_COLOR_0 Video 2 4_4_2018 2_42_38 PM 2.mp4"
-    
-    device = torch.device("cuda")
-    net = SSD("test")
-    net.load_state_dict(torch.load('weights/WIDERFace_DSFD_RES152.pth'))
-    net.to(device).eval()
-
-    base_dir = "/media/forsad/grabell_box2/Study Components/FACS/ICK Videos for FACS"
+    num_devices = 1
+    nets = []
+    for gpu_no in range(num_devices):
+        device = torch.device("cuda:" + str(gpu_no))
+        net = SSD("test:" + str(gpu_no))
+        net.load_state_dict(torch.load('weights/WIDERFace_DSFD_RES152.pth'))
+        net.to(device).eval()
+        nets.append(net)
+    #base_dir = "/media/forsad/grabell_box2/Study Components/FACS/ICK Videos for FACS"
+    base_dir = "/media/forsad/Seagate Expansion Drive/Study Components/FACS/ICK Videos for FACS"
     folders = os.listdir(base_dir)
 
-    out_dir = "/media/forsad/grabell_box2/study_crops"
+    out_dir = "/media/forsad/Seagate Expansion Drive/study_crops_test"
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
 
+    all_fls = []
     for folder in folders:
         #print(folder)
         full_folder = os.path.join(base_dir, folder)
@@ -290,11 +169,15 @@ if __name__ == "__main__":
             if not fl.endswith(".mp4"):
                 continue
             full_p = os.path.join(full_folder, fl)
-
-            print(full_p)
             out_fl = os.path.join(out_folder, fl)
-            video_cap_for_file(full_p, device, out_fl)
-    #fl = "/media/forsad/grabell_box2/Study Components/FACS/ICK Videos for FACS/1001/1001_FETCH_0 Video 1 4_4_2018 2_16_04 PM 1.mp4"
+            all_fls.append((full_p, out_fl))
+    with ThreadPoolExecutor(max_workers=num_devices):
+        for idx, fl in enumerate(all_fls):
+            full_p = fl[0]
+            out_fl = fl[1]
+            gpu_no = idx%num_devices
+            video_cap_for_file(full_p, device, out_fl, nets[gpu_no])
+                #fl = "/media/forsad/grabell_box2/Study Components/FACS/ICK Videos for FACS/1001/1001_FETCH_0 Video 1 4_4_2018 2_16_04 PM 1.mp4"
     #video_cap_for_file(fl, device, out_dir)
     # conf_thresh = 0.3
     # cap = cv2.VideoCapture(fl)

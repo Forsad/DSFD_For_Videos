@@ -73,8 +73,8 @@ class SSD(nn.Module):
             self.last_image_size = None
             self.last_feature_maps = None
 
-        if self.phase == 'test':
-            self.test_transform = TestBaseTransform((104, 117, 123))
+        #if self.phase == 'test':
+        self.test_transform = TestBaseTransform((104, 117, 123))
 
     def forward(self, x):
 
@@ -143,7 +143,8 @@ class SSD(nn.Module):
         #print(detections)
 
         scores = detections[0, 1, :, 0]
-        keep_idxs = scores > keep_thresh  # find keeping indexes
+        keep_idxs = scores > 0.0  # find keeping indexes
+        keep_idxes2 = scores > keep_thresh
         detections = detections[0, 1, keep_idxs, :]  # select detections over threshold
         detections = detections[:, [1, 2, 3, 4, 0]]  # reorder
 
@@ -151,4 +152,4 @@ class SSD(nn.Module):
         detections[:, [1, 3]] -= shift_h_scaled  # 0 or pad percent from top
         detections[:, :4] *= scale
 
-        return detections
+        return (detections, keep_idxes)
